@@ -59,7 +59,7 @@
     var DEFAULTS = {
         rss_enabled:    true,
         rss_cinema:     true,
-        rss_sport:      false,
+        rss_sport:      true,
         rss_tech:       true,
         rss_politics:   false,
         rss_world:      false,
@@ -67,6 +67,7 @@
         rss_custom_1:   '',
         rss_custom_2:   '',
         rss_custom_3:   '',
+        rss_interval:   '5',     // Интервал обновления в минутах (1, 3, 5, 10)
         rss_speed:      '60',
         rss_text_color: '#ffffff',
         rss_bg_color:   '#000000',
@@ -82,14 +83,12 @@
     function get(key) {
         var v = Lampa.Storage.get(key);
         if (v === undefined || v === null) return DEFAULTS[key];
-        // Storage может вернуть строку "true"/"false" — нормализуем
         if (v === 'true')  return true;
         if (v === 'false') return false;
         return v;
     }
     function set(key, val) { Lampa.Storage.set(key, val); }
 
-    // Инициализируем дефолты при первом запуске
     Object.keys(DEFAULTS).forEach(function (k) {
         if (Lampa.Storage.get(k) === undefined) set(k, DEFAULTS[k]);
     });
@@ -107,7 +106,6 @@
         return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
     }
 
-    // Размер шрифта автоматически от высоты строки (~58%)
     function fontSizeFromHeight(height) {
         return Math.round(height * 0.58);
     }
@@ -173,7 +171,7 @@
     function restartAnimation() {
         stopAnimation();
         if (!$inner || !$inner.length) return;
-        _speed     = parseInt(get('rss_speed')) || 60;   // px/sec
+        _speed     = parseInt(get('rss_speed')) || 60;
         _totalWidth = $inner[0].scrollWidth + window.innerWidth;
         _animStart  = null;
 
@@ -188,25 +186,10 @@
     }
 
     // =============================================
-    // ЗАГРУЗКА RSS
+    // ЗАГРУЗКА И ОБРАБОТКА RSS
     // =============================================
     var _fetchTimer;
 
-    function collectUrls() {
-        var urls = [];
-        Object.keys(RSS_FEEDS).forEach(function (cat) {
-            if (get('rss_' + cat)) {
-                urls = urls.concat(RSS_FEEDS[cat].urls);
-            }
-        });
-        ['rss_custom_1', 'rss_custom_2', 'rss_custom_3'].forEach(function (k) {
-            var v = (get(k) || '').trim();
-            if (v && v.indexOf('http') === 0) urls.push(v);
-        });
-        return urls;
-    }
-
-    // Форматирует pubDate в короткий вид: "8 мая"
     function formatDate(pubDateStr) {
         if (!pubDateStr) return '';
         try {
@@ -217,7 +200,6 @@
         } catch (e) { return ''; }
     }
 
-    // Извлекает короткое имя домена из URL: "habr.com"
     function sourceName(url) {
         try {
             return url.replace(/^https?:\/\/(www\.)?/, '').split('/')[0];
@@ -233,13 +215,12 @@
             var showSource = get('rss_show_source');
             var src = sourceName(feedUrl);
 
-            for (var i = 0; i < Math.min(items.length, 6); i++) {
+            for (var i = 0; i < Math.min(items.length, 5); i++) {
                 var titleEl = items[i].querySelector('title');
                 if (!titleEl || !titleEl.textContent) continue;
 
                 var title = titleEl.textContent.trim();
 
-                // Дата
                 var rawDate = '';
                 var pubEl = items[i].querySelector('pubDate') || items[i].querySelector('pubdate');
                 if (pubEl) rawDate = pubEl.textContent;
@@ -249,7 +230,6 @@
                 }
                 var dateStr = formatDate(rawDate);
 
-                // Формат: "8 мая, sports.ru — текст"
                 var prefix = '';
                 if (showDate && dateStr && showSource && src) {
                     prefix = dateStr + ', ' + src + ' — ';
@@ -265,14 +245,17 @@
         } catch (e) { return []; }
     }
 
-    // Перемешивает массивы по принципу round-robin (чередование категорий)
-    function interleave(arrays) {
+    // Чередование элементов из разных категорий (Round-Robin)
+    function interleaveCategories(categoryBuckets) {
         var result = [];
         var maxLen = 0;
-        arrays.forEach(function (a) { if (a.length > maxLen) maxLen = a.length; });
+        categoryBuckets.forEach(function (b) { if (b.length > maxLen) maxLen = b.length; });
+        
         for (var i = 0; i < maxLen; i++) {
-            arrays.forEach(function (a) {
-                if (i < a.length) result.push(a[i]);
+            categoryBuckets.forEach(function (bucket) {
+                if (i < bucket.length) {
+                    result.push(bucket[i]);
+                }
             });
         }
         return result;
@@ -280,42 +263,78 @@
 
     function fetchAll() {
         if (!get('rss_enabled')) return;
-        var urls = collectUrls();
-        if (!urls.length) {
+
+        // Собираем включенные категории
+        var tasks = [];
+        Object.keys(RSS_FEEDS).forEach(function (cat) {
+            if (get('rss_' + cat)) {
+                tasks.push({
+                    key: cat,
+                    urls: RSS_FEEDS[cat].urls
+                });
+            }
+        });
+
+        // Кастомные источники в отдельную категорию
+        var customUrls = [];
+        ['rss_custom_1', 'rss_custom_2', 'rss_custom_3'].forEach(function (k) {
+            var v = (get(k) || '').trim();
+            if (v && v.indexOf('http') === 0) customUrls.push(v);
+        });
+        if (customUrls.length) {
+            tasks.push({ key: 'custom', urls: customUrls });
+        }
+
+        if (!tasks.length) {
             setText('Включите хотя бы одну категорию RSS в настройках плагина.');
             return;
         }
 
-        var buckets = [];   // массив массивов — по одному на каждый url
-        var done = 0;
+        var totalRequests = 0;
+        tasks.forEach(function (t) { totalRequests += t.urls.length; });
 
-        urls.forEach(function (url, idx) {
-            buckets[idx] = [];
-            fetch(url, { cache: 'no-store' })
-                .then(function (r) { return r.text(); })
-                .then(function (xml) {
-                    buckets[idx] = parseXml(xml, url);
-                })
-                .catch(function () {})
-                .finally(function () {
-                    done++;
-                    if (done >= urls.length) {
-                        var headlines;
-                        if (get('rss_shuffle')) {
-                            // Чередуем новости из разных источников
-                            headlines = interleave(buckets.filter(function (b) { return b.length > 0; }));
-                        } else {
-                            // Просто по порядку
-                            headlines = [];
-                            buckets.forEach(function (b) { headlines = headlines.concat(b); });
+        var categoryBuckets = {};
+        tasks.forEach(function (t) { categoryBuckets[t.key] = []; });
+
+        var completed = 0;
+
+        tasks.forEach(function (task) {
+            task.urls.forEach(function (url) {
+                fetch(url, { cache: 'no-store' })
+                    .then(function (r) { return r.text(); })
+                    .then(function (xml) {
+                        var parsed = parseXml(xml, url);
+                        categoryBuckets[task.key] = categoryBuckets[task.key].concat(parsed);
+                    })
+                    .catch(function () {})
+                    .finally(function () {
+                        completed++;
+                        if (completed >= totalRequests) {
+                            // Формируем список массивов с новостями по каждой категории
+                            var activeBuckets = [];
+                            Object.keys(categoryBuckets).forEach(function (k) {
+                                if (categoryBuckets[k].length > 0) {
+                                    activeBuckets.push(categoryBuckets[k]);
+                                }
+                            });
+
+                            var headlines;
+                            if (get('rss_shuffle')) {
+                                // Поочередно берем по 1 новости из каждой категории
+                                headlines = interleaveCategories(activeBuckets);
+                            } else {
+                                headlines = [];
+                                activeBuckets.forEach(function (b) { headlines = headlines.concat(b); });
+                            }
+
+                            if (headlines.length) {
+                                setText(headlines.join(get('rss_separator') || '  ✦  '));
+                            } else {
+                                setText('Не удалось загрузить новости. Проверьте подключение.');
+                            }
                         }
-                        if (headlines.length) {
-                            setText(headlines.join(get('rss_separator') || '  ✦  '));
-                        } else {
-                            setText('Не удалось загрузить новости. Проверьте подключение.');
-                        }
-                    }
-                });
+                    });
+            });
         });
     }
 
@@ -326,14 +345,16 @@
     }
 
     function scheduleRefresh() {
-        clearTimeout(_fetchTimer);
+        if (_fetchTimer) clearInterval(_fetchTimer);
         fetchAll();
-        _fetchTimer = setInterval(fetchAll, 20 * 60 * 1000); // каждые 20 мин
+        var intervalMin = parseInt(get('rss_interval')) || 5;
+        _fetchTimer = setInterval(fetchAll, intervalMin * 60 * 1000);
     }
 
     // =============================================
     // НАСТРОЙКИ — регистрация через SettingsApi
     // =============================================
+    var INTERVAL_OPTS = { '1': '1 минута', '3': '3 минуты', '5': '5 минут', '10': '10 минут' };
     var SPEED_OPTS    = { '30': 'Медленно', '60': 'Нормально', '100': 'Быстро', '150': 'Очень быстро' };
     var OPACITY_OPTS  = { '0.3': '30%', '0.5': '50%', '0.75': '75%', '0.9': '90%', '1': '100%' };
     var COLOR_OPTS    = { '#ffffff': 'Белый', '#000000': 'Чёрный', '#ffff00': 'Жёлтый', '#00ff00': 'Зелёный', '#00ffff': 'Голубой', '#ff4444': 'Красный', '#ff8800': 'Оранжевый' };
@@ -391,6 +412,14 @@
         addCustomInput('rss_custom_2', 'Свой источник 2');
         addCustomInput('rss_custom_3', 'Свой источник 3');
 
+        // --- Интервал обновления ---
+        Lampa.SettingsApi.addParam({
+            component: 'rss_ticker',
+            param: { name: 'rss_interval', type: 'select', values: INTERVAL_OPTS, default: DEFAULTS.rss_interval },
+            field: { name: 'Интервал обновления', description: 'Как часто загружать свежие новости' },
+            onChange: function () { scheduleRefresh(); }
+        });
+
         // --- Внешний вид ---
         function addSelect(key, label, opts, desc) {
             Lampa.SettingsApi.addParam({
@@ -424,7 +453,7 @@
         Lampa.SettingsApi.addParam({
             component: 'rss_ticker',
             param: { name: 'rss_shuffle', type: 'trigger', default: true },
-            field: { name: 'Перемешивать новости', description: 'Чередовать источники: спорт, кино, техно, спорт...' },
+            field: { name: 'Перемешивать категории', description: 'Чередовать по 1 новости из разных категорий' },
             onChange: function () { scheduleRefresh(); }
         });
     }
@@ -433,7 +462,6 @@
     // СКРЫВАТЬ ВО ВРЕМЯ ВОСПРОИЗВЕДЕНИЯ
     // =============================================
     function bindPlayerEvents() {
-        // Lampa player events
         Lampa.Listener.follow('player', function (e) {
             if (!$container) return;
             if (e.type === 'start' || e.type === 'play') {
@@ -444,7 +472,6 @@
             }
         });
 
-        // Резервный способ: MutationObserver следит за появлением тега video в DOM
         var _playerObserver = new MutationObserver(function () {
             if (!$container) return;
             var hasVideo = !!document.querySelector('video');
@@ -476,3 +503,4 @@
     }
 
 })();
+        
